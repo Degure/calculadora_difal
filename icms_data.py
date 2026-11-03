@@ -172,3 +172,164 @@ def calcular_difal(
         f"{o} → {d}. Orientativo — validar com o fiscal na NF."
     )
     return resultado
+
+
+def _fmt_br(v: float) -> str:
+    return f"R$ {v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def calcular_difal_nf(
+    itens: list,
+    frete: float,
+    uf_destino: str,
+    uf_origem: str = UF_ORIGEM_PADRAO,
+) -> dict:
+    """
+    DIFAL para NF com vários produtos (nacionais e/ou importados).
+
+    O frete é diluído por média ponderada no valor de cada produto:
+        frete_item = frete_total × (valor_item / soma_valores_produtos)
+        base_item  = valor_item + frete_item
+
+    Cada item calcula DIFAL com a alíquota interestadual do seu tipo
+    (nacional = matriz; importado = 4%). O DIFAL da NF é a soma.
+    """
+    o = normalizar_uf(uf_origem) or UF_ORIGEM_PADRAO
+    d = normalizar_uf(uf_destino)
+    frete = float(frete or 0)
+    passos = []
+    detalhes = []
+
+    limpos = []
+    for i, it in enumerate(itens or []):
+        if not it:
+            continue
+        valor = float(it.get("valor") or 0)
+        if valor <= 0:
+            continue
+        tipo_raw = (it.get("tipo") or it.get("origem_produto") or "nacional")
+        tipo = "importado" if str(tipo_raw).lower().startswith("import") else "nacional"
+        limpos.append({
+            "descricao": (it.get("descricao") or f"Item {i+1}").strip(),
+            "valor": valor,
+            "tipo": tipo,
+        })
+
+    soma_produtos = sum(x["valor"] for x in limpos)
+    resultado = {
+        "uf_origem": o,
+        "uf_destino": d,
+        "nome_origem": NOMES_UF.get(o, o),
+        "nome_destino": NOMES_UF.get(d, d),
+        "frete": frete,
+        "soma_produtos": soma_produtos,
+        "valor_base_total": round(soma_produtos + frete, 2),
+        "valor_difal": 0.0,
+        "valor_icms_interestadual": 0.0,
+        "valor_icms_interno_teorico": 0.0,
+        "itens": [],
+        "passos": passos,
+        "aplica": False,
+        "observacao": "",
+        "origem_produto_label": "Misto / vários itens",
+        "aliquota_interna_destino": aliquota_interna(d) if d in ICMS_INTERNA else 0.0,
+        "aliquota_interestadual": 0.0,
+        "diferenca_pp": 0.0,
+        "valor_base": round(soma_produtos + frete, 2),
+    }
+
+    if not d or d not in ICMS_INTERNA:
+        passos.append("UF de destino inválida ou vazia.")
+        resultado["observacao"] = "Informe uma UF de destino válida."
+        return resultado
+
+    if not limpos:
+        passos.append("Nenhum produto com valor informado.")
+        resultado["observacao"] = "Adicione ao menos um produto com valor > 0."
+        return resultado
+
+    passos.append(
+        f"1) Soma dos produtos: {_fmt_br(soma_produtos)} · Frete total: {_fmt_br(frete)}"
+    )
+    passos.append(
+        f"2) Frete diluído por média ponderada: frete_item = frete × (valor_item / {_fmt_br(soma_produtos)})"
+    )
+    passos.append(
+        f"3) Origem {o} ({NOMES_UF.get(o, o)}) → Destino {d} ({NOMES_UF.get(d, d)})"
+    )
+    passos.append(
+        f"4) Alíquota interna do destino ({d}): {resultado['aliquota_interna_destino']:.2f}%"
+    )
+
+    if o == d:
+        passos.append("5) Mesma UF → DIFAL = R$ 0,00 (operação interna).")
+        resultado["observacao"] = f"Operação interna ({o}). Não há DIFAL interestadual."
+        # ainda mostra rateio do frete para transparência
+        for it in limpos:
+            share = it["valor"] / soma_produtos if soma_produtos else 0
+            frete_item = round(frete * share, 2)
+            base_item = round(it["valor"] + frete_item, 2)
+            detalhes.append({
+                **it,
+                "frete_rateado": frete_item,
+                "base": base_item,
+                "aliquota_interestadual": aliquota_interestadual(o, d, it["tipo"]),
+                "diferenca_pp": 0.0,
+                "valor_difal": 0.0,
+            })
+        resultado["itens"] = detalhes
+        return resultado
+
+    total_difal = 0.0
+    total_inter = 0.0
+    total_interno = 0.0
+    n = 5
+    for it in limpos:
+        share = it["valor"] / soma_produtos if soma_produtos else 0
+        frete_item = round(frete * share, 2)
+        base_item = round(it["valor"] + frete_item, 2)
+        r = calcular_difal(base_item, d, o, it["tipo"])
+        total_difal += r["valor_difal"]
+        total_inter += r["valor_icms_interestadual"]
+        total_interno += r["valor_icms_interno_teorico"]
+        det = {
+            **it,
+            "frete_rateado": frete_item,
+            "base": base_item,
+            "aliquota_interestadual": r["aliquota_interestadual"],
+            "diferenca_pp": r["diferenca_pp"],
+            "valor_difal": r["valor_difal"],
+            "valor_icms_interestadual": r["valor_icms_interestadual"],
+        }
+        detalhes.append(det)
+        tipo_lbl = "Importado" if it["tipo"] == "importado" else "Nacional"
+        n += 1
+        passos.append(
+            f"{n}) {it['descricao']} ({tipo_lbl}): valor {_fmt_br(it['valor'])} + frete rateado {_fmt_br(frete_item)} "
+            f"= base {_fmt_br(base_item)} · inter. {r['aliquota_interestadual']:.2f}% · "
+            f"Δ {r['diferenca_pp']:.2f} p.p. · DIFAL {_fmt_br(r['valor_difal'])}"
+        )
+
+    resultado["itens"] = detalhes
+    resultado["valor_difal"] = round(total_difal, 2)
+    resultado["valor_icms_interestadual"] = round(total_inter, 2)
+    resultado["valor_icms_interno_teorico"] = round(total_interno, 2)
+    resultado["aplica"] = True
+    # se todos mesmo tipo, preenche alíquota resumida
+    tipos = {x["tipo"] for x in limpos}
+    if len(tipos) == 1:
+        t = next(iter(tipos))
+        resultado["origem_produto_label"] = "Importado" if t == "importado" else "Nacional"
+        resultado["aliquota_interestadual"] = aliquota_interestadual(o, d, t)
+        resultado["diferenca_pp"] = resultado["aliquota_interna_destino"] - resultado["aliquota_interestadual"]
+    else:
+        resultado["origem_produto_label"] = "Misto (nacional + importado)"
+        resultado["aliquota_interestadual"] = 0.0
+        resultado["diferenca_pp"] = 0.0
+
+    passos.append(f"{n+1}) DIFAL total da NF = soma dos itens = {_fmt_br(resultado['valor_difal'])}")
+    resultado["observacao"] = (
+        f"DIFAL estimado da NF: {_fmt_br(resultado['valor_difal'])} "
+        f"({o} → {d}), frete rateado por valor dos produtos. Orientativo — validar com o fiscal."
+    )
+    return resultado
