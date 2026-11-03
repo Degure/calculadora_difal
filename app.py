@@ -85,6 +85,11 @@ if "uf_destino" not in st.session_state:
 # Próximo clique no mapa/grade: "origem" → depois "destino" → volta para "origem"
 if "selecao_passo" not in st.session_state:
     st.session_state.selecao_passo = "destino"  # já há origem padrão; próximo clique = destino
+# Evita loop: não reprocessa a mesma seleção do Plotly em reruns consecutivos
+if "mapa_last_token" not in st.session_state:
+    st.session_state.mapa_last_token = None
+if "mapa_feedback" not in st.session_state:
+    st.session_state.mapa_feedback = ""
 
 
 def _aplicar_uf_clique(sigla: str) -> str:
@@ -100,19 +105,45 @@ def _aplicar_uf_clique(sigla: str) -> str:
         return ""
     if st.session_state.selecao_passo == "origem":
         st.session_state.uf_origem = sigla
+        st.session_state.sel_origem = sigla  # sincroniza o selectbox
         st.session_state.selecao_passo = "destino"
         return f"Origem: **{sigla}**. Agora clique no **destino**."
     # passo destino
     st.session_state.uf_destino = sigla
+    st.session_state.sel_destino = sigla
     st.session_state.selecao_passo = "origem"
-    return f"Destino: **{sigla}**. Par definido: **{st.session_state.uf_origem} → {sigla}**. Próximo clique redefine a **origem**."
+    return (
+        f"Destino: **{sigla}**. Par: **{st.session_state.uf_origem} → {sigla}**. "
+        f"Próximo clique redefine a **origem**."
+    )
+
+
+def _token_selecao_plotly(points: list) -> str:
+    """Identifica unicamente a seleção atual (não muda só porque o passo mudou)."""
+    if not points:
+        return ""
+    pt = points[0] or {}
+    sigla = pt.get("location") or ""
+    if not sigla and isinstance(pt.get("properties"), dict):
+        sigla = pt["properties"].get("sigla") or ""
+    return "|".join(
+        [
+            str(sigla),
+            str(pt.get("point_index", pt.get("pointNumber", ""))),
+            str(pt.get("curveNumber", "")),
+            str(pt.get("lon", "")),
+            str(pt.get("lat", "")),
+        ]
+    )
 
 
 def _fmt_brl(v: float) -> str:
     return f"R$ {v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
+@st.cache_data(show_spinner=False)
 def _carregar_geojson():
+    """GeoJSON ~3MB — em cache para não reler a cada rerun (evita travar no Cloud)."""
     if GEOJSON_PATH.exists():
         with open(GEOJSON_PATH, encoding="utf-8") as f:
             return json.load(f)
@@ -335,38 +366,54 @@ with col_esq:
         )
 
     st.markdown("**UF de origem e destino**")
+    # Mantém selectbox alinhado ao estado (mapa/grade também gravam sel_origem / sel_destino)
+    if "sel_origem" not in st.session_state:
+        st.session_state.sel_origem = st.session_state.uf_origem
+    if "sel_destino" not in st.session_state:
+        st.session_state.sel_destino = st.session_state.uf_destino
+    # Garante valor válido
+    if st.session_state.sel_origem not in UFS_BRASIL:
+        st.session_state.sel_origem = st.session_state.uf_origem
+    if st.session_state.sel_destino not in UFS_BRASIL:
+        st.session_state.sel_destino = st.session_state.uf_destino
+
+    def _sync_origem():
+        st.session_state.uf_origem = st.session_state.sel_origem
+
+    def _sync_destino():
+        st.session_state.uf_destino = st.session_state.sel_destino
+
     c1, c2, c3 = st.columns([1, 1, 1])
     with c1:
-        opts = UFS_BRASIL
-        i_o = opts.index(st.session_state.uf_origem) if st.session_state.uf_origem in opts else opts.index("SC")
-        uf_origem = st.selectbox(
+        st.selectbox(
             "Origem (remetente)",
-            options=opts,
-            index=i_o,
+            options=UFS_BRASIL,
             format_func=lambda u: f"{u} — {NOMES_UF[u]} ({ICMS_INTERNA[u]:.1f}%)",
             key="sel_origem",
+            on_change=_sync_origem,
         )
-        st.session_state.uf_origem = uf_origem
+        st.session_state.uf_origem = st.session_state.sel_origem
     with c2:
-        i_d = opts.index(st.session_state.uf_destino) if st.session_state.uf_destino in opts else opts.index("SP")
-        uf_destino = st.selectbox(
+        st.selectbox(
             "Destino (destinatário)",
-            options=opts,
-            index=i_d,
+            options=UFS_BRASIL,
             format_func=lambda u: f"{u} — {NOMES_UF[u]} ({ICMS_INTERNA[u]:.1f}%)",
             key="sel_destino",
+            on_change=_sync_destino,
         )
-        st.session_state.uf_destino = uf_destino
+        st.session_state.uf_destino = st.session_state.sel_destino
     with c3:
         st.markdown("Digitar UF")
         dig_o = st.text_input("Origem (sigla)", value=st.session_state.uf_origem, max_chars=2, key="txt_o")
         dig_d = st.text_input("Destino (sigla)", value=st.session_state.uf_destino, max_chars=2, key="txt_d")
         if dig_o and normalizar_uf(dig_o) in ICMS_INTERNA:
-            st.session_state.uf_origem = normalizar_uf(dig_o)
-            uf_origem = st.session_state.uf_origem
+            u = normalizar_uf(dig_o)
+            st.session_state.uf_origem = u
+            st.session_state.sel_origem = u
         if dig_d and normalizar_uf(dig_d) in ICMS_INTERNA:
-            st.session_state.uf_destino = normalizar_uf(dig_d)
-            uf_destino = st.session_state.uf_destino
+            u = normalizar_uf(dig_d)
+            st.session_state.uf_destino = u
+            st.session_state.sel_destino = u
 
     # Indicador do próximo clique (sem switch manual)
     prox = st.session_state.selecao_passo
@@ -387,40 +434,26 @@ with col_esq:
 with col_dir:
     st.subheader("2. Mapa do Brasil — alíquota interna")
     st.caption(
-        "🟠 Laranja = origem · 🟢 Verde = destino (os dois ficam destacados juntos). "
-        "1º clique = origem · 2º = destino · 3º = nova origem."
+        "🟠 Origem · 🟢 Destino. "
+        "Escolha a UF na **grade**, no selectbox ou digitando a sigla "
+        "(1º clique = origem · 2º = destino · 3º = nova origem)."
     )
-
-    fig = _mapa_aliquotas(st.session_state.uf_origem, st.session_state.uf_destino)
-    if fig is not None:
-        event = st.plotly_chart(
-            fig,
-            use_container_width=True,
-            on_select="rerun",
-            selection_mode="points",
-            key="mapa_brasil",
-        )
-        try:
-            points = (event or {}).get("selection", {}).get("points", []) if event else []
-            if points:
-                pt = points[0]
-                sigla = None
-                if "location" in pt:
-                    sigla = pt["location"]
-                elif isinstance(pt.get("properties"), dict):
-                    sigla = pt["properties"].get("sigla")
-                if sigla and sigla in ICMS_INTERNA:
-                    msg = _aplicar_uf_clique(sigla)
-                    if msg:
-                        st.success(msg)
-                        st.rerun()
-        except Exception:
-            pass
+    # Mapa é pesado no Cloud (~3MB geojson + Plotly). Só monta se o usuário pedir.
+    mostrar_mapa = st.checkbox("Mostrar mapa interativo", value=False, key="chk_mapa")
+    if mostrar_mapa:
+        with st.spinner("Carregando mapa…"):
+            fig = _mapa_aliquotas(st.session_state.uf_origem, st.session_state.uf_destino)
+        if fig is not None:
+            st.plotly_chart(fig, width="stretch", key="mapa_brasil")
+        else:
+            st.warning("Mapa indisponível. Use a grade de UFs abaixo.")
     else:
-        st.warning(
-            "Mapa indisponível (plotly ou geojson). Use a grade de UFs. "
-            "Instale: `pip install plotly pandas`"
+        st.info(
+            f"Mapa oculto para carregar mais rápido. "
+            f"Seleção atual: **{st.session_state.uf_origem} → {st.session_state.uf_destino}**"
         )
+    if st.session_state.mapa_feedback:
+        st.success(st.session_state.mapa_feedback)
 
 # Grade clicável de UFs (mesmo fluxo automático origem → destino → origem)
 st.markdown("##### Grade rápida de estados (UF + alíquota interna)")
@@ -438,8 +471,9 @@ for i, uf in enumerate(UFS_BRASIL):
             tipo_btn = "primary"
         else:
             tipo_btn = "secondary"
-        if st.button(label, key=f"btn_{uf}", use_container_width=True, type=tipo_btn):
-            _aplicar_uf_clique(uf)
+        if st.button(label, key=f"btn_{uf}", width="stretch", type=tipo_btn):
+            msg = _aplicar_uf_clique(uf)
+            st.session_state.mapa_feedback = msg
             st.rerun()
 
 # ==================== CÁLCULO ====================
@@ -509,11 +543,10 @@ if resultado.get("itens"):
             "DIFAL (R$)": it.get("valor_difal", 0),
         })
     df_itens = pd.DataFrame(rows)
-# Formata colunas monetárias como texto BR para leitura fácil
-for col in ["Valor (R$)", "Frete rateado (R$)", "Base (R$)", "DIFAL (R$)"]:
-    if col in df_itens.columns:
-        df_itens[col] = df_itens[col].map(lambda v: _fmt_brl(float(v)))
-st.dataframe(df_itens, use_container_width=True, hide_index=True)
+    for col in ["Valor (R$)", "Frete rateado (R$)", "Base (R$)", "DIFAL (R$)"]:
+        if col in df_itens.columns:
+            df_itens[col] = df_itens[col].map(lambda v: _fmt_brl(float(v)))
+    st.dataframe(df_itens, width="stretch", hide_index=True)
 
 st.markdown("#### Conta completa (passo a passo)")
 for passo in resultado.get("passos") or []:
@@ -554,7 +587,7 @@ with st.expander("Tabela de alíquotas internas (todos os estados)"):
             "Alíquota interna (%)": [ICMS_INTERNA[u] for u in UFS_BRASIL],
         }
     )
-    st.dataframe(df_tab, use_container_width=True, hide_index=True)
+    st.dataframe(df_tab, width="stretch", hide_index=True)
 
 st.divider()
 st.caption(
